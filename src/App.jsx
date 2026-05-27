@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 
-// ─── Data ────────────────────────────────────────────────────────────────────
+// ─── Checklist Data ───────────────────────────────────────────────────────────
 
 const CHECKLIST_DATA = [
   {
@@ -214,59 +214,35 @@ const CHECKLIST_DATA = [
   },
 ];
 
-const ALL_IDS = CHECKLIST_DATA.flatMap((s) => s.items.map((i) => i.id));
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
-// ─── URL hash persistence ─────────────────────────────────────────────────────
-// Encode as a compact bitfield: sort all IDs consistently, store as base64
-
-function encodeChecked(checked) {
-  const bits = ALL_IDS.map((id) => (checked[id] ? "1" : "0")).join("");
-  // Convert binary string to base64
-  let out = "";
-  for (let i = 0; i < bits.length; i += 6) {
-    const chunk = bits.slice(i, i + 6).padEnd(6, "0");
-    out += "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"[parseInt(chunk, 2)];
-  }
-  return out;
+function generateId() {
+  return Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
 }
 
-function decodeChecked(hash) {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  let bits = "";
-  for (const c of hash) {
-    const idx = chars.indexOf(c);
-    if (idx === -1) return {};
-    bits += idx.toString(2).padStart(6, "0");
-  }
-  const result = {};
-  ALL_IDS.forEach((id, i) => {
-    if (bits[i] === "1") result[id] = true;
-  });
-  return result;
+function getSessionId() {
+  const params = new URLSearchParams(window.location.search);
+  return params.get("s");
 }
 
-function readHash() {
-  const h = window.location.hash.slice(1);
-  if (!h) return {};
-  try { return decodeChecked(h); } catch { return {}; }
+function setSessionIdInUrl(id) {
+  const url = new URL(window.location.href);
+  url.search = `?s=${id}`;
+  window.history.replaceState(null, "", url.toString());
 }
 
-function writeHash(checked) {
-  const encoded = encodeChecked(checked);
-  window.history.replaceState(null, "", "#" + encoded);
-}
+// ─── Print CSS ────────────────────────────────────────────────────────────────
 
-// ─── Print stylesheet injected into <head> ────────────────────────────────────
 const PRINT_CSS = `
 @media print {
   body { background: white !important; color: black !important; }
   .no-print { display: none !important; }
+  .print-only { display: block !important; }
   .print-section { break-inside: avoid; margin-bottom: 16px; }
   .print-header { background: white !important; position: static !important; border-bottom: 2px solid #e31937 !important; padding: 12px 0 8px !important; }
-  .print-item { border-bottom: 1px solid #eee; padding: 5px 0; display: flex; align-items: flex-start; gap: 8px; }
+  .print-section-title { font-size: 13px; font-weight: 700; background: #f3f4f6; padding: 6px 8px; border-radius: 4px; margin-bottom: 4px; display: block; }
+  .print-item { border-bottom: 1px solid #eee; padding: 5px 0; display: flex !important; align-items: flex-start; gap: 8px; }
   .print-item input[type=checkbox] { width: 14px; height: 14px; margin-top: 2px; flex-shrink: 0; }
-  .print-section-title { font-size: 13px; font-weight: 700; background: #f3f4f6; padding: 6px 8px; border-radius: 4px; margin-bottom: 4px; }
-  .print-item-text { font-size: 11px; line-height: 1.4; }
   .print-yl-badge { background: #7c3aed; color: white; font-size: 8px; padding: 1px 4px; border-radius: 3px; font-weight: 800; margin-right: 4px; }
   .print-title { font-size: 22px; font-weight: 800; color: #111; }
   .print-subtitle { font-size: 11px; color: #666; }
@@ -277,12 +253,16 @@ const PRINT_CSS = `
 // ─── App ──────────────────────────────────────────────────────────────────────
 
 export default function App() {
+  const [sessionId, setSessionId] = useState(null);
   const [checked, setChecked] = useState({});
   const [expanded, setExpanded] = useState({ pre: true });
   const [filter, setFilter] = useState("all");
+  const [saveStatus, setSaveStatus] = useState("idle");
+  const [loading, setLoading] = useState(true);
   const [copied, setCopied] = useState(false);
+  const saveTimer = useRef(null);
 
-  // Inject print CSS once
+  // Inject print CSS
   useEffect(() => {
     const style = document.createElement("style");
     style.textContent = PRINT_CSS;
@@ -290,25 +270,67 @@ export default function App() {
     return () => document.head.removeChild(style);
   }, []);
 
-  // Load from URL hash on mount
+  // On mount: resolve or create session ID, then load state from API
   useEffect(() => {
-    const fromHash = readHash();
-    if (Object.keys(fromHash).length > 0) {
-      setChecked(fromHash);
+    async function init() {
+      let id = getSessionId();
+      if (!id) {
+        id = generateId();
+        setSessionIdInUrl(id);
+      }
+      setSessionId(id);
+
+      try {
+        const res = await fetch(`/api/session?id=${id}`);
+        if (res.ok) {
+          const data = await res.json();
+          setChecked(data.checked || {});
+        }
+      } catch (e) {
+        console.warn("Could not load session:", e);
+      } finally {
+        setLoading(false);
+      }
     }
+    init();
   }, []);
 
-  const toggle = useCallback((id) => {
+  // Debounced save to KV
+  const saveToKV = useCallback((checkedState, id) => {
+    if (!id) return;
+    clearTimeout(saveTimer.current);
+    setSaveStatus("saving");
+    saveTimer.current = setTimeout(async () => {
+      try {
+        const res = await fetch(`/api/session?id=${id}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ checked: checkedState }),
+        });
+        if (res.ok) {
+          setSaveStatus("saved");
+          setTimeout(() => setSaveStatus("idle"), 2000);
+        } else {
+          setSaveStatus("error");
+        }
+      } catch {
+        setSaveStatus("error");
+      }
+    }, 600);
+  }, []);
+
+  const toggle = useCallback((itemId) => {
     setChecked((prev) => {
-      const next = { ...prev, [id]: !prev[id] };
-      writeHash(next);
+      const next = { ...prev, [itemId]: !prev[itemId] };
+      saveToKV(next, sessionId);
       return next;
     });
-  }, []);
+  }, [sessionId, saveToKV]);
 
   const handleReset = () => {
+    if (!confirm("Reset all checkboxes for this session?")) return;
     setChecked({});
-    window.history.replaceState(null, "", window.location.pathname);
+    saveToKV({}, sessionId);
   };
 
   const copyLink = () => {
@@ -319,7 +341,6 @@ export default function App() {
   };
 
   const handlePrint = () => {
-    // Expand all sections before printing
     const all = {};
     CHECKLIST_DATA.forEach((s) => (all[s.id] = true));
     setExpanded(all);
@@ -334,6 +355,7 @@ export default function App() {
     CHECKLIST_DATA.forEach((s) => (all[s.id] = true));
     setExpanded(all);
   };
+
   const collapseAll = () => setExpanded({});
 
   const totalItems = CHECKLIST_DATA.reduce((a, s) => a + s.items.length, 0);
@@ -347,6 +369,24 @@ export default function App() {
     if (filter === "done") return items.filter((i) => checked[i.id]);
     return items;
   };
+
+  const saveIndicator = {
+    saving: { color: "#f59e0b", text: "Saving…" },
+    saved:  { color: "#22c55e", text: "✓ Saved" },
+    error:  { color: "#e31937", text: "⚠ Save failed" },
+    idle:   { color: "#374151", text: "" },
+  }[saveStatus];
+
+  if (loading) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", background: "#0a0d14" }}>
+        <div style={{ textAlign: "center" }}>
+          <div style={{ fontSize: "32px", marginBottom: "12px" }}>⚡</div>
+          <div style={{ color: "#6b7280", fontFamily: "monospace", fontSize: "13px" }}>Loading session…</div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div style={s.root}>
@@ -371,8 +411,8 @@ export default function App() {
                 strokeLinecap="round" transform="rotate(-90 40 40)"
                 style={{ transition: "stroke-dashoffset 0.4s ease" }}
               />
-              <text x="40" y="45" textAnchor="middle" fill="white" fontSize="17" fontWeight="700"
-                fontFamily="'DM Mono', monospace">{pct}%</text>
+              <text x="40" y="45" textAnchor="middle" fill="white" fontSize="17"
+                fontWeight="700" fontFamily="'DM Mono', monospace">{pct}%</text>
             </svg>
             <div style={s.scoreLabel}>{checkedCount}/{totalItems}</div>
           </div>
@@ -386,7 +426,7 @@ export default function App() {
           }} />
         </div>
 
-        {/* Controls row */}
+        {/* Controls */}
         <div style={s.controls} className="no-print">
           <div style={s.filterGroup}>
             {["all", "remaining", "done"].map((f) => (
@@ -397,25 +437,28 @@ export default function App() {
             ))}
           </div>
           <div style={s.btnGroup}>
+            {saveStatus !== "idle" && (
+              <span style={{ ...s.saveIndicator, color: saveIndicator.color }}>
+                {saveIndicator.text}
+              </span>
+            )}
             <button onClick={expandAll} style={s.ctrlBtn}>Expand all</button>
             <button onClick={collapseAll} style={s.ctrlBtn}>Collapse all</button>
             <button onClick={copyLink} style={{ ...s.ctrlBtn, color: copied ? "#22c55e" : "#60a5fa" }}>
               {copied ? "✓ Copied!" : "📋 Copy link"}
             </button>
-            <button onClick={handlePrint} style={{ ...s.ctrlBtn, color: "#f59e0b" }}>
-              🖨 Export PDF
-            </button>
-            <button onClick={handleReset} style={{ ...s.ctrlBtn, color: "#e31937" }}>
-              Reset
-            </button>
+            <button onClick={handlePrint} style={{ ...s.ctrlBtn, color: "#f59e0b" }}>🖨 PDF</button>
+            <button onClick={handleReset} style={{ ...s.ctrlBtn, color: "#e31937" }}>Reset</button>
           </div>
         </div>
       </div>
 
-      {/* ── Save reminder banner ── */}
-      <div style={s.saveBanner} className="no-print">
-        <span style={s.saveBannerIcon}>🔗</span>
-        Your progress is saved in the URL. Use <strong>Copy link</strong> to bookmark or share your exact progress.
+      {/* ── Session banner ── */}
+      <div style={s.sessionBanner} className="no-print">
+        <span style={s.sessionDot} />
+        <span style={s.sessionText}>
+          Session <code style={s.sessionCode}>{sessionId}</code> — progress saves automatically to the cloud. Bookmark this URL or tap <strong>Copy link</strong> to return on any device.
+        </span>
       </div>
 
       {/* ── Sections ── */}
@@ -431,8 +474,7 @@ export default function App() {
 
           return (
             <div key={section.id} style={s.section} className="print-section">
-              <button onClick={() => toggleSection(section.id)}
-                className="no-print"
+              <button onClick={() => toggleSection(section.id)} className="no-print"
                 style={{ ...s.sectionHeader, ...(allDone ? s.sectionHeaderDone : {}) }}>
                 <div style={s.sectionLeft}>
                   <span style={s.sectionIcon}>{section.icon}</span>
@@ -447,25 +489,37 @@ export default function App() {
               </button>
 
               {/* Print-only section title */}
-              <div className="print-section-title" style={{ display: "none" }}>
-                {section.icon} {section.title} ({sectionDone}/{sectionTotal})
+              <div className="print-only" style={{ display: "none" }}>
+                <div className="print-section-title">{section.icon} {section.title} ({sectionDone}/{sectionTotal})</div>
+                {section.items.map((item) => {
+                  const isYL = item.text.toLowerCase().startsWith("yl-specific:");
+                  const isChecked = !!checked[item.id];
+                  const displayText = isYL ? item.text.replace(/^YL-specific:\s*/i, "") : item.text;
+                  return (
+                    <div key={item.id} className="print-item" style={{ display: "flex", alignItems: "flex-start", gap: "8px", padding: "4px 8px", borderBottom: "1px solid #eee" }}>
+                      <input type="checkbox" checked={isChecked} readOnly style={{ marginTop: "2px", flexShrink: 0 }} />
+                      <span style={{ fontSize: "11px", lineHeight: "1.4" }}>
+                        {isYL && <span style={{ background: "#7c3aed", color: "white", fontSize: "8px", padding: "1px 4px", borderRadius: "3px", fontWeight: "800", marginRight: "4px" }}>YL</span>}
+                        {displayText}
+                      </span>
+                    </div>
+                  );
+                })}
               </div>
 
-              {(isOpen || true) && (
-                <div style={isOpen ? s.itemList : s.itemListHidden} className="print-item-list">
-                  {(isOpen ? sectionItems : section.items).map((item) => {
+              {isOpen && (
+                <div style={s.itemList} className="no-print">
+                  {sectionItems.map((item) => {
                     const isYL = item.text.toLowerCase().startsWith("yl-specific:");
                     const isChecked = !!checked[item.id];
                     const displayText = isYL ? item.text.replace(/^YL-specific:\s*/i, "") : item.text;
-
                     return (
                       <label key={item.id}
-                        style={{ ...s.item, ...(isChecked ? s.itemChecked : {}) }}
-                        className="print-item">
+                        style={{ ...s.item, ...(isChecked ? s.itemChecked : {}) }}>
                         <input type="checkbox" checked={isChecked}
                           onChange={() => toggle(item.id)} style={s.checkbox} />
-                        <div style={s.itemContent} className="print-item-text">
-                          {isYL && <span style={s.ylBadge} className="print-yl-badge">YL</span>}
+                        <div style={s.itemContent}>
+                          {isYL && <span style={s.ylBadge}>YL</span>}
                           <span style={{ ...s.itemText, ...(isChecked ? s.itemTextDone : {}) }}>
                             {displayText}
                           </span>
@@ -510,10 +564,13 @@ const s = {
   filterGroup: { display: "flex", gap: "4px" },
   filterBtn: { background: "transparent", border: "1px solid #1e2535", color: "#6b7280", padding: "4px 12px", borderRadius: "20px", fontSize: "12px", cursor: "pointer", fontFamily: "inherit" },
   filterBtnActive: { background: "#e31937", borderColor: "#e31937", color: "#fff", fontWeight: "600" },
-  btnGroup: { display: "flex", gap: "10px", flexWrap: "wrap" },
+  btnGroup: { display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" },
+  saveIndicator: { fontSize: "11px", fontFamily: "'DM Mono',monospace" },
   ctrlBtn: { background: "transparent", border: "none", color: "#6b7280", fontSize: "12px", cursor: "pointer", fontFamily: "inherit", padding: "4px 0" },
-  saveBanner: { maxWidth: "760px", margin: "12px auto 0", padding: "0 16px" },
-  saveBannerIcon: { marginRight: "6px" },
+  sessionBanner: { margin: "10px 16px 0", maxWidth: "760px", marginLeft: "auto", marginRight: "auto", padding: "8px 12px", background: "#0e1220", border: "1px solid #1e2535", borderRadius: "8px", display: "flex", alignItems: "flex-start", gap: "8px" },
+  sessionDot: { width: "8px", height: "8px", borderRadius: "50%", background: "#22c55e", flexShrink: 0, marginTop: "4px" },
+  sessionText: { fontSize: "12px", color: "#6b7280", lineHeight: "1.5" },
+  sessionCode: { background: "#1e2535", padding: "1px 5px", borderRadius: "4px", fontFamily: "'DM Mono',monospace", fontSize: "11px", color: "#9ca3af" },
   sections: { maxWidth: "760px", margin: "12px auto 0", padding: "0 16px", display: "flex", flexDirection: "column", gap: "8px" },
   section: { background: "#0e1220", border: "1px solid #1e2535", borderRadius: "10px", overflow: "hidden" },
   sectionHeader: { width: "100%", background: "transparent", border: "none", padding: "14px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", color: "#e8eaf0", fontFamily: "inherit" },
@@ -526,7 +583,6 @@ const s = {
   badgeDone: { background: "#14532d", color: "#4ade80" },
   chevron: { fontSize: "16px", color: "#4b5563", transition: "transform 0.2s ease", display: "block" },
   itemList: { borderTop: "1px solid #1e2535", padding: "4px 0" },
-  itemListHidden: { display: "none" },
   item: { display: "flex", alignItems: "flex-start", gap: "12px", padding: "10px 16px", cursor: "pointer", borderBottom: "1px solid #12172a" },
   itemChecked: { background: "#0a1a0e" },
   checkbox: { marginTop: "2px", flexShrink: 0, accentColor: "#22c55e", width: "16px", height: "16px", cursor: "pointer" },
