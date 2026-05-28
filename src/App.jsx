@@ -11,7 +11,7 @@ const CHECKLIST_DATA = [
       { id: "pre-1", text: "Confirm your assigned VIN on your Tesla account matches delivery paperwork" },
       { id: "pre-2", text: "Download the Tesla app and complete all pre-delivery steps (insurance, payment, registration)" },
       { id: "pre-3", text: "Book a morning delivery appointment — you want natural light for paint inspection" },
-      { id: "pre-4", text: "Bring a USB-C charger to test ports and a microfibre cloth to check paint depth" },
+      { id: "pre-4", text: "Bring a USB-C charger to test all USB-C ports in the cabin" },
       { id: "pre-5", text: "Note: Model YL is sourced from Giga Shanghai — inspect transit damage carefully" },
     ],
   },
@@ -255,14 +255,16 @@ const PRINT_CSS = `
 export default function App() {
   const [sessionId, setSessionId] = useState(null);
   const [checked, setChecked] = useState({});
+  const [notes, setNotes] = useState("");
   const [expanded, setExpanded] = useState({ pre: true });
   const [filter, setFilter] = useState("all");
   const [saveStatus, setSaveStatus] = useState("idle");
+  const [notesSaveStatus, setNotesSaveStatus] = useState("idle");
   const [loading, setLoading] = useState(true);
   const [copied, setCopied] = useState(false);
   const saveTimer = useRef(null);
+  const notesTimer = useRef(null);
 
-  // Inject print CSS
   useEffect(() => {
     const style = document.createElement("style");
     style.textContent = PRINT_CSS;
@@ -270,7 +272,6 @@ export default function App() {
     return () => document.head.removeChild(style);
   }, []);
 
-  // On mount: resolve or create session ID, then load state from API
   useEffect(() => {
     async function init() {
       let id = getSessionId();
@@ -279,12 +280,12 @@ export default function App() {
         setSessionIdInUrl(id);
       }
       setSessionId(id);
-
       try {
         const res = await fetch(`/api/session?id=${id}`);
         if (res.ok) {
           const data = await res.json();
           setChecked(data.checked || {});
+          setNotes(data.notes || "");
         }
       } catch (e) {
         console.warn("Could not load session:", e);
@@ -295,8 +296,7 @@ export default function App() {
     init();
   }, []);
 
-  // Debounced save to KV
-  const saveToKV = useCallback((checkedState, id) => {
+  const saveToKV = useCallback((checkedState, notesState, id) => {
     if (!id) return;
     clearTimeout(saveTimer.current);
     setSaveStatus("saving");
@@ -305,7 +305,7 @@ export default function App() {
         const res = await fetch(`/api/session?id=${id}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ checked: checkedState }),
+          body: JSON.stringify({ checked: checkedState, notes: notesState }),
         });
         if (res.ok) {
           setSaveStatus("saved");
@@ -322,15 +322,40 @@ export default function App() {
   const toggle = useCallback((itemId) => {
     setChecked((prev) => {
       const next = { ...prev, [itemId]: !prev[itemId] };
-      saveToKV(next, sessionId);
+      saveToKV(next, notes, sessionId);
       return next;
     });
-  }, [sessionId, saveToKV]);
+  }, [sessionId, notes, saveToKV]);
+
+  const handleNotesChange = useCallback((value) => {
+    setNotes(value);
+    if (!sessionId) return;
+    clearTimeout(notesTimer.current);
+    setNotesSaveStatus("saving");
+    notesTimer.current = setTimeout(async () => {
+      try {
+        const res = await fetch(`/api/session?id=${sessionId}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ checked, notes: value }),
+        });
+        if (res.ok) {
+          setNotesSaveStatus("saved");
+          setTimeout(() => setNotesSaveStatus("idle"), 2000);
+        } else {
+          setNotesSaveStatus("error");
+        }
+      } catch {
+        setNotesSaveStatus("error");
+      }
+    }, 800);
+  }, [sessionId, checked]);
 
   const handleReset = () => {
-    if (!confirm("Reset all checkboxes for this session?")) return;
+    if (!confirm("Reset all checkboxes and notes for this session?")) return;
     setChecked({});
-    saveToKV({}, sessionId);
+    setNotes("");
+    saveToKV({}, "", sessionId);
   };
 
   const copyLink = () => {
@@ -377,6 +402,13 @@ export default function App() {
     idle:   { color: "#374151", text: "" },
   }[saveStatus];
 
+  const notesSaveIndicator = {
+    saving: { color: "#f59e0b", text: "Saving…" },
+    saved:  { color: "#22c55e", text: "✓ Saved" },
+    error:  { color: "#e31937", text: "⚠ Save failed" },
+    idle:   { color: "#374151", text: "" },
+  }[notesSaveStatus];
+
   if (loading) {
     return (
       <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", background: "#0a0d14" }}>
@@ -418,7 +450,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* Progress bar */}
         <div style={s.progressTrack} className="no-print">
           <div style={{
             ...s.progressFill, width: `${pct}%`,
@@ -426,7 +457,6 @@ export default function App() {
           }} />
         </div>
 
-        {/* Controls */}
         <div style={s.controls} className="no-print">
           <div style={s.filterGroup}>
             {["all", "remaining", "done"].map((f) => (
@@ -488,7 +518,6 @@ export default function App() {
                 </div>
               </button>
 
-              {/* Print-only section title */}
               <div className="print-only" style={{ display: "none" }}>
                 <div className="print-section-title">{section.icon} {section.title} ({sectionDone}/{sectionTotal})</div>
                 {section.items.map((item) => {
@@ -496,7 +525,7 @@ export default function App() {
                   const isChecked = !!checked[item.id];
                   const displayText = isYL ? item.text.replace(/^YL-specific:\s*/i, "") : item.text;
                   return (
-                    <div key={item.id} className="print-item" style={{ display: "flex", alignItems: "flex-start", gap: "8px", padding: "4px 8px", borderBottom: "1px solid #eee" }}>
+                    <div key={item.id} style={{ display: "flex", alignItems: "flex-start", gap: "8px", padding: "4px 8px", borderBottom: "1px solid #eee" }}>
                       <input type="checkbox" checked={isChecked} readOnly style={{ marginTop: "2px", flexShrink: 0 }} />
                       <span style={{ fontSize: "11px", lineHeight: "1.4" }}>
                         {isYL && <span style={{ background: "#7c3aed", color: "white", fontSize: "8px", padding: "1px 4px", borderRadius: "3px", fontWeight: "800", marginRight: "4px" }}>YL</span>}
@@ -514,8 +543,7 @@ export default function App() {
                     const isChecked = !!checked[item.id];
                     const displayText = isYL ? item.text.replace(/^YL-specific:\s*/i, "") : item.text;
                     return (
-                      <label key={item.id}
-                        style={{ ...s.item, ...(isChecked ? s.itemChecked : {}) }}>
+                      <label key={item.id} style={{ ...s.item, ...(isChecked ? s.itemChecked : {}) }}>
                         <input type="checkbox" checked={isChecked}
                           onChange={() => toggle(item.id)} style={s.checkbox} />
                         <div style={s.itemContent}>
@@ -532,6 +560,47 @@ export default function App() {
             </div>
           );
         })}
+
+        {/* ── Notes section ── */}
+        <div style={s.section} className="print-section">
+          <div style={s.sectionHeader}>
+            <div style={s.sectionLeft}>
+              <span style={s.sectionIcon}>📝</span>
+              <span style={s.sectionTitle}>Notes</span>
+            </div>
+          </div>
+          <div style={{ borderTop: "1px solid #1e2535", padding: "12px 16px" }}>
+            <textarea
+              placeholder="Add any notes, defects, or observations here..."
+              value={notes}
+              onChange={(e) => handleNotesChange(e.target.value)}
+              style={{
+                width: "100%",
+                minHeight: "160px",
+                background: "#0a0d14",
+                border: "1px solid #1e2535",
+                borderRadius: "8px",
+                color: "#cbd5e1",
+                fontSize: "13.5px",
+                lineHeight: "1.6",
+                padding: "12px",
+                fontFamily: "'DM Sans','Segoe UI',sans-serif",
+                resize: "vertical",
+                outline: "none",
+              }}
+            />
+            {notesSaveStatus !== "idle" && (
+              <div style={{ fontSize: "11px", fontFamily: "'DM Mono',monospace", marginTop: "6px", color: notesSaveIndicator.color }}>
+                {notesSaveIndicator.text}
+              </div>
+            )}
+          </div>
+          {/* Print version of notes */}
+          <div className="print-only" style={{ display: "none", padding: "8px", borderTop: "1px solid #eee" }}>
+            <div style={{ fontSize: "11px", fontWeight: "700", marginBottom: "4px" }}>📝 Notes</div>
+            <div style={{ fontSize: "11px", lineHeight: "1.6", whiteSpace: "pre-wrap" }}>{notes || "(no notes)"}</div>
+          </div>
+        </div>
       </div>
 
       {/* Footer */}
@@ -567,7 +636,7 @@ const s = {
   btnGroup: { display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" },
   saveIndicator: { fontSize: "11px", fontFamily: "'DM Mono',monospace" },
   ctrlBtn: { background: "transparent", border: "none", color: "#6b7280", fontSize: "12px", cursor: "pointer", fontFamily: "inherit", padding: "4px 0" },
-  sessionBanner: { margin: "10px 16px 0", maxWidth: "760px", marginLeft: "auto", marginRight: "auto", padding: "8px 12px", background: "#0e1220", border: "1px solid #1e2535", borderRadius: "8px", display: "flex", alignItems: "flex-start", gap: "8px" },
+  sessionBanner: { margin: "10px auto 0", maxWidth: "760px", width: "calc(100% - 32px)", padding: "8px 12px", background: "#0e1220", border: "1px solid #1e2535", borderRadius: "8px", display: "flex", alignItems: "flex-start", gap: "8px" },
   sessionDot: { width: "8px", height: "8px", borderRadius: "50%", background: "#22c55e", flexShrink: 0, marginTop: "4px" },
   sessionText: { fontSize: "12px", color: "#6b7280", lineHeight: "1.5" },
   sessionCode: { background: "#1e2535", padding: "1px 5px", borderRadius: "4px", fontFamily: "'DM Mono',monospace", fontSize: "11px", color: "#9ca3af" },

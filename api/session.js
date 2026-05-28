@@ -16,12 +16,12 @@ export default async function handler(req, res) {
 
   if (req.method === 'GET') {
     const data = await kv.get(`session:${id}`);
-    return res.status(200).json({ checked: data ?? {} });
+    return res.status(200).json({ checked: data?.checked ?? {}, notes: data?.notes ?? '' });
   }
 
   if (req.method === 'POST') {
-    const { checked } = req.body;
-    await kv.set(`session:${id}`, checked, { ex: 60 * 60 * 24 * 365 });
+    const { checked, notes } = req.body;
+    await kv.set(`session:${id}`, { checked, notes }, { ex: 60 * 60 * 24 * 365 });
     return res.status(200).json({ ok: true });
   }
 
